@@ -12,6 +12,9 @@
 
 ---
 
+> [!IMPORTANT]
+> 最新安全更新要求配置独立的 `TELEGRAM_WEBHOOK_SECRET`，并将 Telegram Webhook 重新设置为 Worker 的 `/telegram-webhook` 路径。同步代码后如果跳过这一步，机器人将无法接收 Telegram 消息。
+
 <details>
 <summary>📢 <b>v5.4 版本重要更新公告 (2026-06-06)</b></summary>
    
@@ -30,9 +33,16 @@
 - `/info` 指令增加可点击跳转用户私聊（手机端）
 - `/cleanup` 可在任意话题执行，不再受限
 
+### 最新安全加固：
+- Telegram Webhook 仅接受固定的 `/telegram-webhook` 路径，并通过 `X-Telegram-Bot-Api-Secret-Token` 请求头校验来源
+- Turnstile 验证页和回调严格校验参数，并对 HTML 与内联 JavaScript 分别编码，降低 XSS 风险
+- 验证页增加禁止 iframe 嵌入、禁止 MIME 猜测和不发送 Referrer 等安全响应头
+- Telegram Bot API 固定使用官方 `https://api.telegram.org`；旧的 `API_BASE` 配置将被忽略
+
 ### ⚠️ 更新指南：
-Fork 用户可直接点击 sync 更新同步，自动更新
-手动部署用户复制 worker.js 代码到 worker，重新部署一次，并添加新的环境变量
+Fork 用户可点击 Sync fork 同步代码；手动部署用户需复制最新的 `worker.js` 并重新部署。
+
+所有升级用户还必须新增 `TELEGRAM_WEBHOOK_SECRET`，并按本文“最后一步”重新注册 Webhook。
 </details>
 
 ---
@@ -180,6 +190,7 @@ SPAM_KEYWORDS = 加微信,引流,免费领,点击链接,加我QQ,日赚,兼职,�
     * **添加环境变量**：
         * `BOT_TOKEN`: 你的机器人 Token。
         * `SUPERGROUP_ID`: 你的群组 ID (例如 -100123...)。
+        * `TELEGRAM_WEBHOOK_SECRET`: 独立的 Webhook 密钥（必填，建议保存为 Secret；16–256 位，仅使用字母、数字、`_`、`-`；不要与 `BOT_TOKEN` 相同）。
     * **（推荐）添加反骚扰变量**（详见 [反骚扰系统说明](#-反骚扰系统说明-v54-新增)）：
         * `TURNSTILE_SITE_KEY`、`TURNSTILE_SECRET_KEY`、`VERIFICATION_PAGE_URL`（启用 Turnstile）
         * `SPAM_KEYWORDS`：广告关键词（启用内容过滤）
@@ -200,6 +211,7 @@ SPAM_KEYWORDS = 加微信,引流,免费领,点击链接,加我QQ,日赚,兼职,�
     * 添加**环境变量**：
         * `BOT_TOKEN`: 你的机器人 Token。
         * `SUPERGROUP_ID`: 你的群组 ID (例如 -100123...)。
+        * `TELEGRAM_WEBHOOK_SECRET`: 独立的 Webhook 密钥（必填，建议保存为 Secret；16–256 位，仅使用字母、数字、`_`、`-`；不要与 `BOT_TOKEN` 相同）。
     * **（推荐）添加反骚扰环境变量**（详见 [反骚扰系统说明](#-反骚扰系统说明-v54-新增)）：
         * `TURNSTILE_SITE_KEY`: Cloudflare Turnstile Site Key（可选）
         * `TURNSTILE_SECRET_KEY`: Cloudflare Turnstile Secret Key（可选）
@@ -211,15 +223,18 @@ SPAM_KEYWORDS = 加微信,引流,免费领,点击链接,加我QQ,日赚,兼职,�
 
 ### 最后一步：激活 Webhook (至关重要)
 
-无论使用哪种部署方式，最后都需要手动告诉 Telegram 你的 Worker 地址。请在浏览器中**严格按顺序**访问以下 URL：
+无论使用哪种部署方式，最后都需要告诉 Telegram 新的固定 Webhook 地址，并传入与 Worker 环境变量完全相同的密钥。
 
- **设置新 Webhook**：
+1. 在 Cloudflare Worker 中设置 `TELEGRAM_WEBHOOK_SECRET`。建议使用至少 32 位的独立随机值，只能包含字母、数字、`_`、`-`。
+2. 执行以下命令注册 Webhook：
+
+    ```bash
+    curl --request POST "https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook" \
+      --data-urlencode "url=<YOUR_WORKER_URL>/telegram-webhook" \
+      --data-urlencode "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
     ```
-   (https://api.telegram.org/bot)<YOUR_TOKEN>/setWebhook?url=<YOUR_WORKER_URL>
-    ```
-    *将 `<YOUR_TOKEN>` 替换为机器人 Token，`<YOUR_WORKER_URL>` 替换为 Worker 的完整域名或者你绑定的自定义的域名 (如 `https://xxx.workers.dev`)。*
-    
- *举例：https://api.telegram.org/bot1234:HUSH2GW/setWebhook?url=https://1234.workers.dev* `<YOUR_TOKEN>前面的bot别删了`
+
+将 `<YOUR_TOKEN>` 替换为机器人 Token，`<YOUR_WORKER_URL>` 替换为 Worker 的完整域名（例如 `https://xxx.workers.dev`），并保证 `<TELEGRAM_WEBHOOK_SECRET>` 与 Cloudflare 中设置的值完全一致。不要在 Worker URL 后重复添加 `/telegram-webhook`。
 
 如果返回 `{"ok":true, "result":true, "description":"Webhook was set"}`，即表示部署成功！
 
@@ -228,7 +243,7 @@ SPAM_KEYWORDS = 加微信,引流,免费领,点击链接,加我QQ,日赚,兼职,�
 ## ❓ 常见问题 (FAQ)
 
 **Q1: 为什么点击验证按钮没有反应？**
-A: 请检查 Webhook 是否正确设置。必须确保 Telegram 允许发送 `callback_query` 事件。请务必执行上述“最后一步”中的重置操作。
+A: 请检查 Webhook 是否已设置为 `<YOUR_WORKER_URL>/telegram-webhook`，且注册时传入的 `secret_token` 与 Worker 的 `TELEGRAM_WEBHOOK_SECRET` 完全一致。Webhook 配置错误时，普通消息和 `callback_query` 都无法处理。
 
 **Q2: 为什么机器人无法在群里创建话题？**
 A: 请确保：1. 群组 ID 正确（-100开头）；2. 群组已开启 Topics 功能；3. 机器人是群管理员且拥有 "Manage Topics" 权限。
@@ -240,8 +255,7 @@ A: 前往 Cloudflare Dashboard → Turnstile 创建站点 → 获取 Site Key �
 A: 如果配置了 Turnstile 相关变量，机器人会优先使用 Turnstile；如果没配置，会自动降级为本地题库验证。两者不需要同时开启。
 
 **Q6: 为什么人机验证能通过收不到转发的消息？**
-A: 请仔细检查所有变量名称和id是否准确，删除webhook再重新激活。
- `(https://api.telegram.org/bot)<YOUR_TOKEN>/deleteWebhook?drop_pending_updates=true` 
+A: 请先检查 `BOT_TOKEN`、`SUPERGROUP_ID` 和 `TELEGRAM_WEBHOOK_SECRET`，再确认 Webhook 地址以 `/telegram-webhook` 结尾并携带了相同的 `secret_token`。如需清除旧配置，可调用 `https://api.telegram.org/bot<YOUR_TOKEN>/deleteWebhook?drop_pending_updates=true`，然后按“最后一步”重新注册。
   
   如果依然无法正常转发消息，尝试完成所有步骤后，最后再添加bot的管理员权限。
 
@@ -249,14 +263,16 @@ A: 请仔细检查所有变量名称和id是否准确，删除webhook再重新�
 A: 系统通过三重机制过滤骚扰消息：1) 关键词匹配（`SPAM_KEYWORDS` 环境变量配置的广告关键词）；2) 新用户链接拦截（24小时内禁止发链接）；3) 重复消息熔断（相同内容重复3次）。被拦截的消息不会转发到群组，但会在群组发送通知。管理员可以使用 `/trust` 将正常用户设为永久信任，免除此类检测。
   
 **Q5: 为什么webhook设置失败？**
-A: 如果你设置了自定义域名不成功，Webhook 改回 workers.dev 域名再尝试。这种情况是你域名解析失败或者网络环境阻断造成的
+A: 检查 Worker URL 是否可访问、路径是否为 `/telegram-webhook`，以及 `TELEGRAM_WEBHOOK_SECRET` 是否为 16–256 位且只包含字母、数字、`_`、`-`。如果自定义域名不可用，可改用 `workers.dev` 域名重试。
  
 ---
 
 ## 🔒 安全说明
 
 > [!IMPORTANT]
-> 请妥善保管您的 Bot API Token 和 Turnstile Secret Key，不要泄露。`TURNSTILE_SITE_KEY` 是唯一可以公开的反骚扰变量（仅用于前端页面渲染），`TURNSTILE_SECRET_KEY` 必须保密。
+> 请妥善保管 `BOT_TOKEN`、`TURNSTILE_SECRET_KEY` 和 `TELEGRAM_WEBHOOK_SECRET`，不要写入仓库、截图或日志，也不要重复使用同一个值。`TURNSTILE_SITE_KEY` 可以公开，它仅用于前端页面渲染。
+>
+> Worker 只会向 Telegram 官方的 `https://api.telegram.org` 发送 Bot API 请求。出于防止 Token 泄露的考虑，`API_BASE` 已不再支持，旧配置会被忽略。
 
 ---
 

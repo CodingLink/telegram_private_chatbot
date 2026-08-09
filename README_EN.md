@@ -13,6 +13,9 @@ Deploy a free, enterprise-grade customer service system utilizing Cloudflare's p
 
 ---
 
+> [!IMPORTANT]
+> The latest security update requires a separate `TELEGRAM_WEBHOOK_SECRET` and a new Telegram webhook pointing to the Worker's `/telegram-webhook` path. The bot cannot receive Telegram messages after upgrading until both are configured.
+
 <details>
 <summary>📢 <b>v5.4 Major Update (2026-06-06)</b></summary>
 
@@ -31,9 +34,16 @@ Deploy a free, enterprise-grade customer service system utilizing Cloudflare's p
 - `/info` now includes a clickable direct chat link (mobile)
 - `/cleanup` can be executed from any topic, not just user topics
 
+### Latest Security Hardening:
+- Telegram webhook requests are accepted only at `/telegram-webhook` and authenticated using the `X-Telegram-Bot-Api-Secret-Token` header
+- Turnstile page and callback parameters are strictly validated, with context-specific escaping for HTML and inline JavaScript to reduce XSS risk
+- The verification page now blocks iframe embedding, disables MIME sniffing, and sends no referrer information
+- Telegram Bot API requests are pinned to the official `https://api.telegram.org`; legacy `API_BASE` settings are ignored
+
 ### ⚠️ Upgrade Guide:
-Fork users: click "Sync fork" to auto-update.
-Manual deploy users: copy the updated `worker.js`, redeploy, and add the new environment variables.
+Fork users: click "Sync fork" to update the code. Manual deploy users: copy the latest `worker.js` and redeploy.
+
+All upgrading users must also add `TELEGRAM_WEBHOOK_SECRET` and re-register the webhook as described in "Final Step" below.
 </details>
 
 ---
@@ -159,6 +169,7 @@ This is the simplest automated deployment method. Cloudflare will automatically 
     * **Add Environment Variables**:
         * `BOT_TOKEN`: Your bot token.
         * `SUPERGROUP_ID`: Your group ID (e.g., -100123...).
+        * `TELEGRAM_WEBHOOK_SECRET`: A separate webhook secret (required; store it as a Secret; 16–256 characters using only letters, numbers, `_`, and `-`; do not reuse `BOT_TOKEN`).
     * **(Recommended) Add Anti-Spam Variables** (see [Anti-Spam System](#-anti-spam-system-new-in-v54)):
         * `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`, `VERIFICATION_PAGE_URL` (for Turnstile)
         * `SPAM_KEYWORDS`: Ad keywords (for content filtering)
@@ -176,20 +187,28 @@ If you don't want to link GitHub, you can copy the code directly.
 6.  **Configure KV & Variables**:
     * Go to **Settings** -> **Variables**.
     * Add KV Binding: Variable name `TOPIC_MAP`, bind to a KV database.
-    * Add Environment Variables: `BOT_TOKEN` and `SUPERGROUP_ID`.
+    * Add Environment Variables:
+        * `BOT_TOKEN`: Your bot token.
+        * `SUPERGROUP_ID`: Your group ID (e.g., -100123...).
+        * `TELEGRAM_WEBHOOK_SECRET`: A separate webhook secret (required; store it as a Secret; 16–256 characters using only letters, numbers, `_`, and `-`; do not reuse `BOT_TOKEN`).
     * Click **Save and Deploy**.
 
 ---
 
 ### Final Step: Activate Webhook (Crucial)
 
-Regardless of the deployment method, you must manually tell Telegram your Worker address. Visit the following URL in your browser **strictly in order**:
+Regardless of the deployment method, you must register the fixed webhook path with Telegram and provide the same secret configured in the Worker.
 
- **Set New Webhook**:
+1. Set `TELEGRAM_WEBHOOK_SECRET` in the Cloudflare Worker. Use a separate random value of at least 32 characters containing only letters, numbers, `_`, and `-`.
+2. Register the webhook:
+
+    ```bash
+    curl --request POST "https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook" \
+      --data-urlencode "url=<YOUR_WORKER_URL>/telegram-webhook" \
+      --data-urlencode "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
     ```
-    [https://api.telegram.org/bot](https://api.telegram.org/bot)<YOUR_TOKEN>/setWebhook?url=<YOUR_WORKER_URL>
-    ```
-    *Replace `<YOUR_TOKEN>` with your bot token, and `<YOUR_WORKER_URL>` with your Worker's full domain or custom domain (e.g., `https://xxx.workers.dev`).*
+
+Replace `<YOUR_TOKEN>` with the bot token and `<YOUR_WORKER_URL>` with the Worker's full origin (for example, `https://xxx.workers.dev`). `<TELEGRAM_WEBHOOK_SECRET>` must exactly match the Cloudflare variable. Do not append `/telegram-webhook` twice.
 
 If it returns `{"ok":true, "result":true, "description":"Webhook was set"}`, the deployment is successful!
 
@@ -198,7 +217,7 @@ If it returns `{"ok":true, "result":true, "description":"Webhook was set"}`, the
 ## ❓ FAQ
 
 **Q: Why does clicking the verification button do nothing?**
-A: Please check if the Webhook is set correctly. You must ensure Telegram is allowed to send `callback_query` events. Please perform the reset operation in the "Final Step" above.
+A: Confirm that the webhook points to `<YOUR_WORKER_URL>/telegram-webhook` and that the `secret_token` used during registration exactly matches the Worker's `TELEGRAM_WEBHOOK_SECRET`. An incorrect webhook configuration prevents both messages and `callback_query` updates from being processed.
 
 **Q: Why can't the bot create topics in the group?**
 A: Please ensure: 1. Group ID is correct (starts with -100); 2. Topics are enabled in the group; 3. The bot is an administrator and has "Manage Topics" permission.
@@ -212,14 +231,17 @@ A: If Turnstile variables are configured, the bot uses Turnstile by default. If 
 **Q: Why are some messages being blocked as spam?**
 A: The system uses three-layer detection: 1) Keyword matching (via `SPAM_KEYWORDS` env var); 2) Link blocking for new users (24h period); 3) Repeat message circuit breaker (3+ identical messages). Blocked messages are not forwarded. Use `/trust` to whitelist legitimate users.
 
+**Q: Why does the webhook return 403 or 503?**
+A: `403` means Telegram's request did not include the configured secret or sent a different value; re-register the webhook with `secret_token`. `503` means `TELEGRAM_WEBHOOK_SECRET` is missing or invalid in the Worker. It must be 16–256 characters using only letters, numbers, `_`, and `-`.
+
 ---
 
 ## 🔒 Security Note
 
 > [!IMPORTANT]
-> Please keep your Bot API Token, Turnstile Secret Key, and other sensitive information safe. Do not share them with others or expose them in public repositories.
-> 
-> The `TURNSTILE_SITE_KEY` is the only anti-spam variable safe to make public (it's used in the frontend HTML page). `TURNSTILE_SECRET_KEY` must remain private.
+> Keep `BOT_TOKEN`, `TURNSTILE_SECRET_KEY`, and `TELEGRAM_WEBHOOK_SECRET` out of repositories, screenshots, and logs, and do not reuse the same value for multiple secrets. `TURNSTILE_SITE_KEY` may be public because it is used only by the frontend page.
+>
+> The Worker sends Bot API requests only to Telegram's official `https://api.telegram.org`. To prevent token leakage, `API_BASE` is no longer supported and legacy values are ignored.
 
 ---
 

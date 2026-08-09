@@ -27,7 +27,8 @@ const CONFIG = {
     SPAM_MESSAGE_HASH_TTL: 3600,          // 消息去重 hash 缓存 1 小时
     SPAM_REPEAT_MESSAGE_LIMIT: 3,         // 相同内容重复次数阈值
     SPAM_NOTIFY_ADMIN: true,              // 是否通知管理员有骚扰消息
-    SPAM_SILENCE_MODE: false              // 静默丢弃模式（不通知管理员）
+    SPAM_SILENCE_MODE: false,             // 静默丢弃模式（不通知管理员）
+    TELEGRAM_WEBHOOK_PATH: "/telegram-webhook" // Telegram webhook 专用路径
 };
 
 // 线程健康检查缓存，减少频繁探测请求
@@ -603,6 +604,28 @@ async function handleSpamMessage(env, userId, msg, spamResult, threadId) {
     }
 }
 
+// --- XSS 安全编码辅助函数 ---
+// 用于 HTML 文本和属性上下文，避免外部输入被解释为标签/属性。
+function escapeHtml(value) {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// 用于内联 <script> 中的 JavaScript 字符串值。
+// JSON.stringify 负责 JS 字符串转义，再额外转义可终止 <script> 或影响 HTML 解析的字符。
+function safeJsonForInlineScript(value) {
+    return JSON.stringify(String(value))
+        .replace(/</g, '\\u003c')
+        .replace(/>/g, '\\u003e')
+        .replace(/&/g, '\\u0026')
+        .replace(/\u2028/g, '\\u2028')
+        .replace(/\u2029/g, '\\u2029');
+}
+
 // --- Turnstile 验证页面 HTML 模板 ---
 // 由 Worker 的 GET /verify 端点渲染，用户点击 bot 按钮后跳转到此页面
 // 模板变量：{{SITE_KEY}} {{CODE}} {{USER_ID}} {{WORKER_URL}}
@@ -634,12 +657,12 @@ p.desc{color:#666;font-size:14px;margin-bottom:24px;line-height:1.6}
   <h2>人机验证</h2>
   <p class="desc">请完成下方验证以确认您不是机器人。<br>验证通过后您的消息将自动送达。</p>
   <div class="turnstile-container">
-    <div class="cf-turnstile" data-sitekey="{{SITE_KEY}}" data-callback="onTurnstileSuccess" data-error-callback="onTurnstileError" data-theme="light"></div>
+    <div class="cf-turnstile" data-sitekey="{{SITE_KEY_HTML}}" data-callback="onTurnstileSuccess" data-error-callback="onTurnstileError" data-theme="light"></div>
   </div>
   <div id="status">正在加载验证组件...</div>
   <a id="back-btn" href="tg://resolve" style="display:none;margin-top:16px;background:#0088cc;color:#fff;border:none;padding:12px 24px;border-radius:8px;font-size:16px;text-decoration:none;">📱 返回 Telegram</a>
   <div class="footer">
-    User: <span>{{USER_ID}}</span> · Code: <span>{{CODE}}</span>
+    User: <span>{{USER_ID_HTML}}</span> · Code: <span>{{CODE_HTML}}</span>
   </div>
 </div>
 <script>
@@ -653,10 +676,10 @@ function onTurnstileSuccess(token) {
   if (submitted) return;
   submitted = true;
   showStatus('✅ 验证通过！正在通知机器人...', 'success');
-  fetch('{{WORKER_URL}}/verify-callback', {
+  fetch({{WORKER_URL_JS}} + '/verify-callback', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token: token, code: '{{CODE}}', userId: '{{USER_ID}}' })
+    body: JSON.stringify({ token: token, code: {{CODE_JS}}, userId: {{USER_ID_JS}} })
   })
   .then(function(r) { return r.json(); })
   .then(function(data) {
@@ -739,19 +762,44 @@ export default {
             if (!code || !userId || !siteKey) {
                 return new Response(
                     '<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><h2>❌ 参数无效</h2><p>缺少验证信息或系统未配置 Turnstile。</p></body></html>',
-                    { headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+                    { status: 400, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+                );
+            }
+
+            // 【安全修复】严格限制公开 URL 参数格式，阻断反射型 XSS 输入载荷。
+            // generateVerifyCode() 固定产生 16 字节随机数，即 32 位小写十六进制字符串。
+            if (!/^[a-f0-9]{32}$/.test(code) || !/^\d{1,20}$/.test(userId)) {
+                Logger.warn('verify_page_invalid_params', {
+                    hasCode: !!code,
+                    codeLength: code.length,
+                    userIdLength: userId.length
+                });
+                return new Response(
+                    '<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><h2>❌ 参数无效</h2><p>验证链接格式不正确。</p></body></html>',
+                    { status: 400, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
                 );
             }
 
             const workerUrl = url.origin;
 
-            return new Response(VERIFY_PAGE_HTML
-                .replace(/{{SITE_KEY}}/g, siteKey)
-                .replace(/{{CODE}}/g, code)
-                .replace(/{{USER_ID}}/g, userId)
-                .replace(/{{WORKER_URL}}/g, workerUrl),
-                { headers: { 'Content-Type': 'text/html; charset=utf-8' } }
-            );
+            // 根据实际输出上下文分别编码：HTML/属性使用实体编码，内联 JS 使用安全 JSON 字面量。
+            const renderedVerifyPage = VERIFY_PAGE_HTML
+                .replace(/{{SITE_KEY_HTML}}/g, escapeHtml(siteKey))
+                .replace(/{{CODE_HTML}}/g, escapeHtml(code))
+                .replace(/{{USER_ID_HTML}}/g, escapeHtml(userId))
+                .replace(/{{CODE_JS}}/g, safeJsonForInlineScript(code))
+                .replace(/{{USER_ID_JS}}/g, safeJsonForInlineScript(userId))
+                .replace(/{{WORKER_URL_JS}}/g, safeJsonForInlineScript(workerUrl));
+
+            return new Response(renderedVerifyPage, {
+                headers: {
+                    'Content-Type': 'text/html; charset=utf-8',
+                    // 防止验证页面被其他站点 iframe 嵌入，进一步降低 Web 攻击面。
+                    'X-Frame-Options': 'DENY',
+                    'X-Content-Type-Options': 'nosniff',
+                    'Referrer-Policy': 'no-referrer'
+                }
+            });
         }
 
         return new Response("Not Found", { status: 404 });
@@ -767,6 +815,14 @@ export default {
 
             if (!token || !code || !userId) {
                 return new Response(JSON.stringify({ success: false, error: 'missing_params' }), {
+                    status: 400,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
+
+            // 与 /verify 页面保持同样的参数约束，拒绝畸形/注入型输入。
+            if (!/^[a-f0-9]{32}$/.test(String(code)) || !/^\d{1,20}$/.test(String(userId))) {
+                return new Response(JSON.stringify({ success: false, error: 'invalid_params' }), {
                     status: 400,
                     headers: { 'Content-Type': 'application/json' }
                 });
@@ -898,19 +954,45 @@ export default {
         }
     }
 
-    // 仅处理 Telegram webhook POST 请求（Content-Type: application/json）
+    // /verify-callback 已在上方处理；这里开始只接受 Telegram webhook。
     if (request.method === "POST" && (url.pathname === "/verify-callback" || url.pathname.endsWith("/verify-callback"))) {
-        // 已在上面处理，这里不应该到达，但作为兜底
         return new Response("OK");
     }
 
-    if (request.method !== "POST") return new Response("OK");
+    if (request.method !== "POST") {
+        return new Response("Method Not Allowed", { status: 405 });
+    }
 
-    // 验证 Content-Type
+    // 【安全修复】Telegram webhook 使用独立固定路径，避免任意 POST 路径进入 update 处理。
+    if (url.pathname !== CONFIG.TELEGRAM_WEBHOOK_PATH) {
+        return new Response("Not Found", { status: 404 });
+    }
+
+    // 【安全修复】验证 Telegram setWebhook(secret_token=...) 注入的请求头。
+    // 不要把 TELEGRAM_WEBHOOK_SECRET 设置成 BOT_TOKEN，也不要记录其明文日志。
+    const expectedWebhookSecret = (env.TELEGRAM_WEBHOOK_SECRET || "").toString().trim();
+    if (!expectedWebhookSecret) {
+        Logger.error('telegram_webhook_secret_missing', 'TELEGRAM_WEBHOOK_SECRET is not configured');
+        return new Response("Service Unavailable", { status: 503 });
+    }
+
+    // Telegram secret_token 仅允许 A-Z、a-z、0-9、_、-；这里额外要求至少 16 字符。
+    if (!/^[A-Za-z0-9_-]{16,256}$/.test(expectedWebhookSecret)) {
+        Logger.error('telegram_webhook_secret_invalid_config', 'TELEGRAM_WEBHOOK_SECRET format is invalid');
+        return new Response("Service Unavailable", { status: 503 });
+    }
+
+    const receivedWebhookSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
+    if (receivedWebhookSecret !== expectedWebhookSecret) {
+        Logger.warn('telegram_webhook_auth_failed', { path: url.pathname });
+        return new Response("Forbidden", { status: 403 });
+    }
+
+    // 只有通过 webhook secret 校验后才解析 Telegram update。
     const contentType = request.headers.get("content-type") || "";
     if (!contentType.includes("application/json")) {
         Logger.warn('invalid_content_type', { contentType });
-        return new Response("OK");
+        return new Response("Unsupported Media Type", { status: 415 });
     }
 
     let update;
@@ -1960,22 +2042,18 @@ function buildTopicTitle(from) {
   return title;
 }
 
-// 改进的 Telegram API 调用（添加超时和 HTTPS 强制）
+// Telegram API 调用（安全版：固定使用 Telegram 官方 API）
 async function tgCall(env, method, body, timeout = CONFIG.API_TIMEOUT_MS) {
-  let base = env.API_BASE || "https://api.telegram.org";
-
-  // 【修复 #20】强制 HTTPS
-  if (base.startsWith("http://")) {
-      Logger.warn('api_http_upgraded', { originalBase: base });
-      base = base.replace("http://", "https://");
-  }
-
-  // 验证 URL 格式
-  try {
-      new URL(`${base}/test`);
-  } catch (e) {
-      Logger.error('api_base_invalid', e, { base });
-      base = "https://api.telegram.org";
+  // 安全修复：不再允许通过 API_BASE 将 Bot Token 和 API 请求发送到第三方域名。
+  // 如果旧部署仍配置了 API_BASE，仅记录其被忽略；日志不包含 Bot Token。
+  const base = "https://api.telegram.org";
+  if (env.API_BASE && String(env.API_BASE).trim() && String(env.API_BASE).trim() !== base) {
+      Logger.warn('api_base_ignored_for_security', {
+          configuredHost: (() => {
+              try { return new URL(String(env.API_BASE).trim()).host; }
+              catch (_) { return 'invalid'; }
+          })()
+      });
   }
 
   // 【修复 #13】添加超时控制
